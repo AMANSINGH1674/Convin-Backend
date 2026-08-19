@@ -26,7 +26,7 @@ func TestInsertEventThenExists(t *testing.T) {
 		t.Fatal("expected event to be absent before insert")
 	}
 
-	if err := s.InsertEvent(ctx, evt); err != nil {
+	if _, err := s.InsertEvent(ctx, evt); err != nil {
 		t.Fatalf("InsertEvent: %v", err)
 	}
 
@@ -36,6 +36,33 @@ func TestInsertEventThenExists(t *testing.T) {
 	}
 	if !exists {
 		t.Fatal("expected event to exist after insert")
+	}
+}
+
+func TestInsertEventReturnsFalseOnDuplicate(t *testing.T) {
+	s := testutil.NewStore(t)
+	eventID, callID, accountID := testutil.IDs(t, s)
+	ctx := context.Background()
+
+	evt := store.Event{
+		EventID: eventID, CallID: callID, AccountID: accountID,
+		Status: "completed", DurationSec: 10, Payload: []byte(`{}`),
+	}
+
+	inserted, err := s.InsertEvent(ctx, evt)
+	if err != nil {
+		t.Fatalf("InsertEvent (1st): %v", err)
+	}
+	if !inserted {
+		t.Fatal("expected first insert to return true")
+	}
+
+	inserted, err = s.InsertEvent(ctx, evt)
+	if err != nil {
+		t.Fatalf("InsertEvent (2nd): %v", err)
+	}
+	if inserted {
+		t.Fatal("expected duplicate insert to return false")
 	}
 }
 
