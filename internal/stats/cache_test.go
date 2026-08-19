@@ -30,3 +30,33 @@ func TestCacheGetUnknownAccountIsZero(t *testing.T) {
 		t.Fatalf("got %+v, want zero value", got)
 	}
 }
+
+// TestCacheRecordConcurrent verifies that concurrent Record() calls don't
+// race. Run with `go test -race` to detect the data race in Record().
+func TestCacheRecordConcurrent(t *testing.T) {
+	c := stats.NewCache()
+
+	const goroutines = 50
+	const perGoroutine = 100
+	done := make(chan struct{})
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			for i := 0; i < perGoroutine; i++ {
+				c.Record("acc_shared", 1)
+			}
+			done <- struct{}{}
+		}()
+	}
+	for g := 0; g < goroutines; g++ {
+		<-done
+	}
+
+	got := c.Get("acc_shared")
+	want := int64(goroutines * perGoroutine)
+	if got.CallCount != want {
+		t.Fatalf("CallCount = %d, want %d", got.CallCount, want)
+	}
+	if got.TotalDurationSec != want {
+		t.Fatalf("TotalDurationSec = %d, want %d", got.TotalDurationSec, want)
+	}
+}
