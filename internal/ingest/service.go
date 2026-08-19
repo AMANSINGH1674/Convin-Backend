@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -22,11 +23,28 @@ type Service struct {
 	cache *stats.Cache
 	rdb   *redis.Client
 	log   *slog.Logger
+	wg    sync.WaitGroup
 }
 
 // New builds a Service.
 func New(s *store.Store, c *stats.Cache, rdb *redis.Client, log *slog.Logger) *Service {
 	return &Service{store: s, cache: c, rdb: rdb, log: log}
+}
+
+// Shutdown waits for any in-flight recording goroutines to finish, honouring
+// the supplied context's deadline.
+func (s *Service) Shutdown(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Stats returns the cached totals for an account.
@@ -73,10 +91,18 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 	s.cache.Record(rec.AccountID, rec.DurationSec)
 
 	// Recordings are slow to fetch, so that part does not block the provider.
+	// We use context.WithoutCancel so the goroutine survives the HTTP request
+	// completing, and track it with a WaitGroup for graceful shutdown.
 	if rec.RecordingURL != "" {
+		bgCtx := context.WithoutCancel(ctx)
+		s.wg.Add(1)
 		go func() {
-			if err := s.processRecording(ctx, rec); err != nil {
-				// TODO: handle
+			defer s.wg.Done()
+			if err := s.processRecording(bgCtx, rec); err != nil {
+				s.log.Error("processRecording failed",
+					"call_id", rec.CallID,
+					"err", err,
+				)
 			}
 		}()
 	}
