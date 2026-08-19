@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/convin/webhook-ingest/internal/testutil"
 )
@@ -80,5 +81,38 @@ func TestDuplicateDeliveryIsIgnored(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("stored %d copies of %s, want 1", n, eventID)
+	}
+}
+
+// TestRecordingGetsMarkedProcessed verifies that the background goroutine
+// actually marks the call's recording as processed. Before the fix: the
+// goroutine inherited the HTTP request context which was cancelled immediately
+// after the handler returned 200, so MarkRecordingProcessed silently failed.
+func TestRecordingGetsMarkedProcessed(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	body := eventJSON(eventID, callID, accountID)
+	if resp := post(t, srv.URL+"/webhooks/calls", body); resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d, want 200", resp.StatusCode)
+	}
+
+	// The recording processing takes ~50ms. Wait up to 2s for it to finish.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var processed bool
+		row := st.Pool().QueryRow(ctx,
+			`SELECT recording_processed FROM calls WHERE call_id = $1`, callID)
+		if err := row.Scan(&processed); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if processed {
+			return // success
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("recording_processed still false after 2s — context bug?")
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
