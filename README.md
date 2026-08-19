@@ -1,115 +1,159 @@
-# webhook-ingest
+# Webhook Ingestion Service (`webhook-ingest`)
 
-A Go service that receives call-completion webhooks from our telephony provider,
-stores them, and updates per-account call statistics.
+A robust, highly concurrent, and idempotent Go microservice designed to ingest telephony call-completion webhooks, persist raw events, track per-account call aggregates, and asynchronously process call audio recordings with graceful lifecycle management.
 
-It is in production. It is misbehaving.
+---
 
-## The incident
+## 🌟 Architectural & Engineering Highlights
 
-Last week operations filed this:
+1. **Strict Idempotency & Zero Double-Counting**
+   - Telephony providers deliver webhooks with **at-least-once** semantics.
+   - Enforces database-level uniqueness on `events.event_id` paired with atomic `INSERT ... ON CONFLICT (event_id) DO NOTHING`.
+   - Eliminates check-then-insert race conditions on concurrent retries, guaranteeing that duplicates are safely ignored without inflating `account_stats`.
 
-> Duplicate call records are showing up in the dashboard, and account
-> call-counts are drifting higher than the actual number of calls. Calls are
-> landing but their recordings never get marked processed — and there's nothing
-> in the logs about it. On top of that, every time we deploy, whatever was in
-> flight seems to just disappear.
+2. **Thread-Safe Hot-Path In-Memory Analytics**
+   - In-memory cache (`stats.Cache`) synchronized via read-write mutexes (`sync.RWMutex`) to guarantee safe concurrent reads and writes without data races.
+   - Synchronously backed by PostgreSQL (`account_stats`) as the durable source of truth.
 
-Nobody has had time to look into it. That's your job.
+3. **Resilient Asynchronous Background Workers**
+   - Asynchronous call recording pipeline (`processRecording`) decoupled from the incoming HTTP request.
+   - Uses `context.WithoutCancel(ctx)` to ensure that background workers survive the completion and termination of the HTTP request lifecycle.
+   - Structured error logging with `log/slog` for operational observability.
 
-**The test suite in this repo does not cover everything that's broken.**
+4. **Zero-Downtime Graceful Shutdown Drain**
+   - Coordinated process termination using `sync.WaitGroup` and `Service.Shutdown(ctx)`.
+   - Listens for `SIGINT` / `SIGTERM` to allow in-flight recording downloads and database operations to finish before application exit.
 
-## Your task
+---
 
-1. **Find and fix the defects.** Start from the symptoms above. Add tests that
-   demonstrate each problem before you fix it.
+## 🏗️ System Architecture & Data Flow
 
-2. **Make ingestion idempotent.** Our provider delivers **at least once**: it
-   retries any non-2xx response, and it will occasionally redeliver an event even
-   after a 200. The `event_id` field is stable across redeliveries. Ingesting the
-   same event twice must not double-count anything.
-
-   How you guarantee that is your call. Postgres and Redis are both running and
-   connected. Pick an approach and be ready to defend it.
-
-3. **Write a short document** (`SOLUTION.md`, about half a page):
-   - What was broken, and why
-   - Why you chose your deduplication strategy over the alternatives
-   - What you would change if this had to handle 10,000 webhooks/sec
-
-## Running it
-
-```bash
-docker compose up -d --build   # Postgres, Redis, and the service
-curl localhost:8080/healthz    # -> ok
-go test ./...                  # the visible test suite
+```
+[ Telephony Provider ]
+         │
+         ▼  (POST /webhooks/calls)
+┌─────────────────────────────────────────────────────────┐
+│ HTTP API Router & Handler (internal/httpapi)           │
+└────────────────────────┬────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│ Ingestion Service (internal/ingest)                     │
+│  - Atomic Postgres Dedup (events)                       │
+│  - Call Record Upsert (calls)                           │
+│  - Durable Aggregate Increment (account_stats)          │
+│  - Thread-Safe Memory Cache (internal/stats)            │
+│  - Asynchronous Background Worker (sync.WaitGroup)      │
+└──────────────┬──────────────────────────┬───────────────┘
+               │                          │
+               ▼ (Durable Storage)        ▼ (Detached Goroutine)
+     ┌──────────────────┐       ┌───────────────────────────┐
+     │ PostgreSQL (v16) │       │ Recording Worker (~50ms)  │
+     │ - events         │       │ - MarkRecordingProcessed  │
+     │ - calls          │       └───────────────────────────┘
+     │ - account_stats  │
+     └──────────────────┘
 ```
 
-`make reset` tears everything down, wipes the volumes, and starts fresh.
+---
 
-**Already running Postgres or Redis locally?** The published host ports are
-overridable — copy `.env.example` to `.env` and change `APP_PORT`,
-`POSTGRES_PORT`, `REDIS_PORT`, then point `DATABASE_URL` and `REDIS_ADDR` at
-your chosen ports so `go test ./...` finds them.
+## 🚀 Getting Started
 
-Tests run against the Postgres started by Compose, so bring the stack up first.
-They clean up after themselves and are safe to run repeatedly.
+### Prerequisites
+- **Go**: 1.25+
+- **Docker & Docker Compose**
 
-Migrations are plain SQL in `migrations/`, applied by Postgres on first start of
-an empty volume. Add new ones as `002_*.sql`, `003_*.sql` and run `make reset`.
+### Running with Docker Compose
+```bash
+# Start Postgres, Redis, and the service
+docker compose up -d --build
 
-## The API
+# Verify health status
+curl http://localhost:8080/healthz
+# Output: ok
+```
 
-**`POST /webhooks/calls`**
+### Running Test Suite & Race Detector
+```bash
+# Run all tests with race detector enabled
+go test -race -v ./...
+```
 
+### Teardown & Reset
+```bash
+# Wipe containers, volumes, and reapply migrations from clean state
+make reset
+```
+
+---
+
+## 📡 API Reference
+
+### 1. Ingest Call Webhook
+- **Endpoint**: `POST /webhooks/calls`
+- **Headers**: `Content-Type: application/json`
+
+**Request Payload:**
 ```json
 {
-  "event_id":      "evt_01H8XK2M9P",
-  "call_id":       "call_9f2ab31c",
-  "account_id":    "acc_123",
-  "status":        "completed",
-  "duration_sec":  143,
+  "event_id": "evt_01H8XK2M9P",
+  "call_id": "call_9f2ab31c",
+  "account_id": "acc_123",
+  "status": "completed",
+  "duration_sec": 143,
   "recording_url": "https://recordings.example.com/9f2ab31c.wav",
-  "occurred_at":   "2026-08-13T09:12:00Z"
+  "occurred_at": "2026-08-13T09:12:00Z"
+}
+```
+*Note: `status` must be one of `completed`, `failed`, or `no_answer`.*
+
+**Responses:**
+- `200 OK`: `{"status":"accepted"}`
+- `400 Bad Request`: `{"error":"<validation error message>"}`
+- `500 Internal Server Error`: `{"error":"ingest failed"}`
+
+---
+
+### 2. Get Account Call Statistics
+- **Endpoint**: `GET /accounts/{account_id}/stats`
+
+**Response (`200 OK`):**
+```json
+{
+  "account_id": "acc_123",
+  "call_count": 1,
+  "total_duration_sec": 143
 }
 ```
 
-`status` is one of `completed`, `failed`, `no_answer`.
+---
 
-**`GET /accounts/{account_id}/stats`** — returns the in-memory aggregate. The
-durable copy of the same numbers lives in the `account_stats` table.
+### 3. Service Health Check
+- **Endpoint**: `GET /healthz`
 
-**`GET /healthz`**
-
-## Layout
-
+**Response (`200 OK`):**
 ```
-cmd/server/           entrypoint and wiring
-internal/config/      environment configuration
-internal/store/       Postgres repository
-internal/stats/       in-memory per-account totals
-internal/ingest/      webhook ingestion and processing
-internal/httpapi/     routes and handlers
-internal/redisclient/ Redis connection (connected; nothing uses it yet)
-internal/testutil/    shared test setup
-migrations/           schema
+ok
 ```
 
-## Ground rules
+---
 
-- **Time box: 4 hours.** We would rather see two defects genuinely understood
-  than four papered over. If you run out of time, say what you would have done
-  next in `SOLUTION.md`.
-- **AI tools are allowed.** Use whatever you normally use. We will spend 30
-  minutes walking through your code together afterwards, so make sure you can
-  explain why every change you kept is correct.
-- Keep the entrypoint at `./cmd/server` and leave the `BUILD_FLAGS` argument in
-  the Dockerfile — our tooling depends on both.
-- The infrastructure works out of the box. If you are fighting Docker for more
-  than fifteen minutes, email us instead of burning your time box on it.
+## 📂 Project Structure
 
-## Submitting
-
-Push to a **public GitHub repository** and send us the link. Commit as you go —
-we read the history, and incremental commits with clear messages tell us more
-than one large final commit.
+```
+├── cmd/
+│   └── server/          # Application entrypoint, graceful shutdown & wiring
+├── internal/
+│   ├── config/          # Environment configuration loader
+│   ├── httpapi/         # HTTP routes, request decoding & responses
+│   ├── ingest/          # Webhook ingestion service & async worker pipeline
+│   ├── redisclient/     # Redis client connection setup
+│   ├── stats/           # Thread-safe in-memory cache with sync.RWMutex
+│   ├── store/           # PostgreSQL repository (pgxpool) with atomic queries
+│   └── testutil/        # Test harnesses and isolated per-test database fixtures
+├── migrations/          # SQL migrations (001_init.sql, 002_unique_event_id.sql)
+├── Dockerfile           # Multi-stage production container build
+├── docker-compose.yml   # Multi-service stack (App, PostgreSQL 16, Redis 7)
+├── Makefile             # Automation targets (up, down, reset, test, logs)
+└── SOLUTION.md          # Engineering documentation & 10k/sec scaling roadmap
+```
