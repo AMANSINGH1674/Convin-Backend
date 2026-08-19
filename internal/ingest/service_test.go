@@ -116,3 +116,31 @@ func TestRecordingGetsMarkedProcessed(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
+// TestDuplicateDeliveryDoesNotDoubleCountStats verifies that redelivering the
+// same event_id does not inflate account_stats — the symptom that ops reported.
+// Before the fix: the check-then-insert race allowed duplicates to increment
+// account_stats multiple times.
+func TestDuplicateDeliveryDoesNotDoubleCountStats(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	body := eventJSON(eventID, callID, accountID)
+	for i := 0; i < 3; i++ {
+		if resp := post(t, srv.URL+"/webhooks/calls", body); resp.StatusCode != http.StatusOK {
+			t.Fatalf("delivery %d: got %d, want 200", i, resp.StatusCode)
+		}
+	}
+
+	stats, err := st.AccountStats(ctx, accountID)
+	if err != nil {
+		t.Fatalf("AccountStats: %v", err)
+	}
+	if stats.CallCount != 1 {
+		t.Fatalf("call_count = %d after 3 deliveries of same event, want 1", stats.CallCount)
+	}
+	if stats.TotalDurationSec != 143 {
+		t.Fatalf("total_duration_sec = %d, want 143", stats.TotalDurationSec)
+	}
+}
